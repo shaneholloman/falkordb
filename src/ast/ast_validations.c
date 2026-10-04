@@ -18,6 +18,8 @@
 #include "../util/identifier_limits.h"
 #include "../arithmetic/arithmetic_expression.h"
 
+#include <strings.h>   // strcasecmp
+
 typedef enum {
 	NOT_DEFINED = -0x01,  // Yet to be defined
 	REGULAR = 0x00,       // UNION
@@ -737,6 +739,7 @@ static VISITOR_STRATEGY _Validate_projection
 static AST_Validation _ValidateFunctionCall
 (
 	const char *funcName,    // function name
+	uint argc,               // number of arguments passed to the function
 	bool include_aggregates  // are aggregations allowed
 ) {
 	if (_ValidateNameLength (funcName, "Function name") == AST_INVALID) {
@@ -753,6 +756,27 @@ static AST_Validation _ValidateFunctionCall
 		// Provide a unique error for using aggregate functions from inappropriate contexts
 		ErrorCtx_SetError(EMSG_INVALID_USE_OF_AGGREGATION_FUNCTION, funcName);
 		return AST_INVALID;
+	}
+
+	// validate the number of arguments matches the function's expected arity
+	// this mirrors the runtime check performed when constructing the arithmetic
+	// expression, catching the error during AST validation instead so that
+	// plan construction is never reached with a poisoned error state
+	AR_FuncDesc *fdesc = AR_GetFunc(funcName, false);
+	if(fdesc != NULL) {
+		// UDF invocations carry two implicit leading arguments
+		// (library name & function name); account for them so the comparison
+		// matches the registered arity
+		uint effective_argc = fdesc->udf ? argc + 2 : argc;
+		if(fdesc->min_argc > effective_argc) {
+			ErrorCtx_SetError(EMSG_FUNCTION_MIN_ARGS, effective_argc,
+							  fdesc->name, fdesc->min_argc);
+			return AST_INVALID;
+		} else if(fdesc->max_argc < effective_argc) {
+			ErrorCtx_SetError(EMSG_FUNCTION_MAX_ARGS, effective_argc,
+							  fdesc->name, fdesc->max_argc);
+			return AST_INVALID;
+		}
 	}
 
 	return AST_VALID;
@@ -805,8 +829,10 @@ static VISITOR_STRATEGY _Validate_apply_operator
 	// Collect the function name.
 	const cypher_astnode_t *func = cypher_ast_apply_operator_get_func_name(n);
 	const char *func_name = cypher_ast_function_name_get_value(func);
-	if(_ValidateFunctionCall(func_name, (vctx->clause == CYPHER_AST_WITH ||
-										vctx->clause == CYPHER_AST_RETURN)) == AST_INVALID) {
+	uint arg_count = cypher_ast_apply_operator_narguments(n);
+	if(_ValidateFunctionCall(func_name, arg_count,
+							(vctx->clause == CYPHER_AST_WITH ||
+							 vctx->clause == CYPHER_AST_RETURN)) == AST_INVALID) {
 		return VISITOR_BREAK;
 	}
 
@@ -2158,6 +2184,41 @@ static VISITOR_STRATEGY _Validate_index_creation
 
 	vctx->clause = cypher_astnode_type(n);
 
+	// reject an unknown index-type keyword (the grammar accepts any word as the
+	// type; only these are meaningful)
+	const cypher_astnode_t *type =
+		cypher_ast_create_pattern_props_index_get_index_type(n);
+	const char *tn = (type != NULL) ? cypher_ast_string_get_value(type) : NULL;
+	if(tn != NULL) {
+		if(strcasecmp(tn, "fulltext") != 0 && strcasecmp(tn, "vector") != 0 &&
+				strcasecmp(tn, "cch") != 0) {
+			ErrorCtx_SetError("Unknown index type '%s'", tn);
+			return VISITOR_BREAK;
+		}
+	}
+
+	// a multi relationship-type pattern ()-[e:A|B]->() is only meaningful for a
+	// CCH path index, whose hierarchy spans several types. every other index
+	// type consumes a single label (cypher_ast_create_pattern_props_index_get_label)
+	// and would silently ignore the rest, so reject it here rather than build a
+	// partial index over just the first type
+	bool is_cch = (tn != NULL && strcasecmp(tn, "cch") == 0);
+	if(!is_cch && cypher_ast_create_pattern_props_index_pattern_is_relation(n)) {
+		uint nreltypes  = 0;
+		uint nchildren  = cypher_astnode_nchildren(n);
+		for(uint i = 0; i < nchildren; i++) {
+			if(cypher_astnode_type(cypher_astnode_get_child(n, i)) ==
+					CYPHER_AST_LABEL) {
+				nreltypes++;
+			}
+		}
+		if(nreltypes > 1) {
+			ErrorCtx_SetError("Multiple relationship types in a single index "
+					"are only supported for CCH indexes");
+			return VISITOR_BREAK;
+		}
+	}
+
 	const cypher_astnode_t *id = cypher_ast_create_pattern_props_index_get_identifier(n);
 	const char *name = cypher_ast_identifier_get_name(id);
 	_IdentifierAdd(vctx, name, NULL);
@@ -2178,6 +2239,37 @@ static VISITOR_STRATEGY _Validate_index_deletion
 	}
 
 	vctx->clause = cypher_astnode_type(n);
+
+	const cypher_astnode_t *type =
+		cypher_ast_drop_pattern_props_index_get_index_type(n);
+	const char *tn = (type != NULL) ? cypher_ast_string_get_value(type) : NULL;
+	if(tn != NULL) {
+		if(strcasecmp(tn, "fulltext") != 0 && strcasecmp(tn, "vector") != 0 &&
+				strcasecmp(tn, "cch") != 0) {
+			ErrorCtx_SetError("Unknown index type '%s'", tn);
+			return VISITOR_BREAK;
+		}
+	}
+
+	// a multi relationship-type pattern ()-[e:A|B]->() is only meaningful for a
+	// CCH path index; every other index type consumes a single label and would
+	// silently drop only the first type, so reject it here (mirrors creation)
+	bool is_cch = (tn != NULL && strcasecmp(tn, "cch") == 0);
+	if(!is_cch && cypher_ast_drop_pattern_props_index_pattern_is_relation(n)) {
+		uint nreltypes  = 0;
+		uint nchildren  = cypher_astnode_nchildren(n);
+		for(uint i = 0; i < nchildren; i++) {
+			if(cypher_astnode_type(cypher_astnode_get_child(n, i)) ==
+					CYPHER_AST_LABEL) {
+				nreltypes++;
+			}
+		}
+		if(nreltypes > 1) {
+			ErrorCtx_SetError("Multiple relationship types in a single index "
+					"are only supported for CCH indexes");
+			return VISITOR_BREAK;
+		}
+	}
 
 	const cypher_astnode_t *id = cypher_ast_drop_pattern_props_index_get_identifier(n);
 	const char *name = cypher_ast_identifier_get_name(id);
